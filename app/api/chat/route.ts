@@ -35,47 +35,48 @@ Use simple language, avoid excessive jargon.`;
 
 // ─── Route handler ────────────────────────────────────────────
 export async function POST(req: NextRequest) {
-  try {
-    const { messages } = await req.json();
-    const lastMessage: string = messages[messages.length - 1]?.content || '';
+  // Parse body ONCE outside try/catch so it's always accessible
+  let messages: { role: string; content: string }[] = [];
+  let lastMessage = '';
 
+  try {
+    const body = await req.json();
+    messages    = body.messages ?? [];
+    lastMessage = messages[messages.length - 1]?.content ?? '';
+  } catch {
+    return NextResponse.json({ reply: 'Could not read your message. Please try again.' }, { status: 400 });
+  }
+
+  try {
     // ── Priority 1: Google Gemini (free tier, no billing required) ──
     if (process.env.GEMINI_API_KEY) {
       return await callGemini(messages, lastMessage);
     }
 
-    // ── Priority 2: OpenAI (requires billing) ──────────────────────
+    // ── Priority 2: OpenAI (requires $5 billing) ───────────────────
     if (process.env.OPENAI_API_KEY) {
       return await callOpenAI(messages, lastMessage);
     }
 
-    // ── Priority 3: Groq (free tier) ──────────────────────────────
+    // ── Priority 3: Groq (free tier, fast LLaMA) ───────────────────
     if (process.env.GROQ_API_KEY) {
       return await callGroq(messages, lastMessage);
     }
 
-    // ── No AI key configured – use smart keyword fallback ──────────
-    return NextResponse.json({
-      reply: getFallbackReply(lastMessage),
-    });
+    // ── No AI key set – smart keyword fallback ─────────────────────
+    console.warn('[Chat API] No AI key found. Using keyword fallback. Set GEMINI_API_KEY, OPENAI_API_KEY, or GROQ_API_KEY.');
+    return NextResponse.json({ reply: getFallbackReply(lastMessage) });
 
   } catch (error: unknown) {
-    // Log the real error so you can see it in Vercel logs
     const errMsg = error instanceof Error ? error.message : String(error);
     console.error('[Chat API Error]:', errMsg);
 
-    // If it's a quota/billing error from OpenAI, give a specific hint in logs
     if (errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('billing')) {
-      console.error(
-        '[Chat API] ⚠️  OpenAI quota exceeded. Add billing at platform.openai.com/settings/billing ' +
-        'OR set GEMINI_API_KEY from aistudio.google.com (free).'
-      );
+      console.error('[Chat API] ⚠️  Quota/billing error. Add billing at platform.openai.com OR set GEMINI_API_KEY from aistudio.google.com (free).');
     }
 
-    return NextResponse.json(
-      { reply: getFallbackReply((await req.json().catch(() => ({ messages: [] }))).messages?.slice(-1)[0]?.content || '') },
-      { status: 200 },
-    );
+    // lastMessage is safely in scope here now
+    return NextResponse.json({ reply: getFallbackReply(lastMessage) }, { status: 200 });
   }
 }
 
@@ -103,7 +104,7 @@ async function callGemini(
   };
 
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
     {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
