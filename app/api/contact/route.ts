@@ -24,7 +24,7 @@ export async function POST(req: NextRequest) {
       await resend.emails.send({
         from:    'BrightSmile Website <noreply@brightsmileclinic.com>',
         to:      clinicEmail,
-        replyTo: data.email,
+        reply_To: data.email,
         subject: `Website Contact: ${data.subject} – ${data.name}`,
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
