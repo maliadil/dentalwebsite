@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server';
-import OpenAI from 'openai';
 
 // ─── System prompt ────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are Denty, a friendly and professional AI dental assistant for BrightSmile Dental Clinic in New York.
@@ -38,39 +37,157 @@ Use simple language, avoid excessive jargon.`;
 export async function POST(req: NextRequest) {
   try {
     const { messages } = await req.json();
+    const lastMessage: string = messages[messages.length - 1]?.content || '';
 
-    if (!process.env.OPENAI_API_KEY) {
-      // Fallback responses when no API key is configured
-      return NextResponse.json({
-        reply: getFallbackReply(messages[messages.length - 1]?.content || ''),
-      });
+    // ── Priority 1: Google Gemini (free tier, no billing required) ──
+    if (process.env.GEMINI_API_KEY) {
+      return await callGemini(messages, lastMessage);
     }
 
-    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    // ── Priority 2: OpenAI (requires billing) ──────────────────────
+    if (process.env.OPENAI_API_KEY) {
+      return await callOpenAI(messages, lastMessage);
+    }
 
-    const response = await client.chat.completions.create({
-      model:       'gpt-4o-mini',
+    // ── Priority 3: Groq (free tier) ──────────────────────────────
+    if (process.env.GROQ_API_KEY) {
+      return await callGroq(messages, lastMessage);
+    }
+
+    // ── No AI key configured – use smart keyword fallback ──────────
+    return NextResponse.json({
+      reply: getFallbackReply(lastMessage),
+    });
+
+  } catch (error: unknown) {
+    // Log the real error so you can see it in Vercel logs
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('[Chat API Error]:', errMsg);
+
+    // If it's a quota/billing error from OpenAI, give a specific hint in logs
+    if (errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('billing')) {
+      console.error(
+        '[Chat API] ⚠️  OpenAI quota exceeded. Add billing at platform.openai.com/settings/billing ' +
+        'OR set GEMINI_API_KEY from aistudio.google.com (free).'
+      );
+    }
+
+    return NextResponse.json(
+      { reply: getFallbackReply((await req.json().catch(() => ({ messages: [] }))).messages?.slice(-1)[0]?.content || '') },
+      { status: 200 },
+    );
+  }
+}
+
+// ─── Google Gemini (FREE – recommended) ───────────────────────
+async function callGemini(
+  messages: { role: string; content: string }[],
+  lastMessage: string,
+): Promise<NextResponse> {
+  // Build Gemini conversation history (all except last user message)
+  const history = messages.slice(0, -1).map((m) => ({
+    role:  m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: m.content }],
+  }));
+
+  const body = {
+    system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
+    contents: [
+      ...history,
+      { role: 'user', parts: [{ text: lastMessage }] },
+    ],
+    generationConfig: {
+      maxOutputTokens: 300,
+      temperature:     0.7,
+    },
+  };
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+    {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(body),
+    },
+  );
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Gemini error ${res.status}: ${err}`);
+  }
+
+  const data = await res.json();
+  const reply: string =
+    data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ||
+    getFallbackReply(lastMessage);
+
+  return NextResponse.json({ reply });
+}
+
+// ─── OpenAI (requires $5+ billing) ───────────────────────────
+async function callOpenAI(
+  messages: { role: string; content: string }[],
+  lastMessage: string,
+): Promise<NextResponse> {
+  const { default: OpenAI } = await import('openai');
+  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+  const response = await client.chat.completions.create({
+    model:       'gpt-4o-mini',
+    max_tokens:  300,
+    temperature: 0.7,
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      ...messages.slice(-10).map((m) => ({
+        role:    m.role as 'user' | 'assistant',
+        content: m.content,
+      })),
+    ],
+  });
+
+  const reply =
+    response.choices[0]?.message?.content?.trim() ||
+    getFallbackReply(lastMessage);
+
+  return NextResponse.json({ reply });
+}
+
+// ─── Groq (FREE – fast LLaMA models) ─────────────────────────
+async function callGroq(
+  messages: { role: string; content: string }[],
+  lastMessage: string,
+): Promise<NextResponse> {
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method:  'POST',
+    headers: {
+      'Content-Type':  'application/json',
+      'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model:       'llama-3.1-8b-instant',
       max_tokens:  300,
       temperature: 0.7,
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
-        ...messages.slice(-10).map((m: { role: string; content: string }) => ({
+        ...messages.slice(-10).map((m) => ({
           role:    m.role as 'user' | 'assistant',
           content: m.content,
         })),
       ],
-    });
+    }),
+  });
 
-    const reply = response.choices[0]?.message?.content?.trim() || 'Sorry, I couldn\'t generate a response.';
-    return NextResponse.json({ reply });
-
-  } catch (error) {
-    console.error('[Chat API Error]:', error);
-    return NextResponse.json(
-      { reply: 'I\'m having trouble connecting right now. Please call us at **(555) 123-4567** or email **info@brightsmileclinic.com** — we\'re happy to help!' },
-      { status: 200 }, // Return 200 so the client shows the message gracefully
-    );
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Groq error ${res.status}: ${err}`);
   }
+
+  const data = await res.json();
+  const reply: string =
+    data?.choices?.[0]?.message?.content?.trim() ||
+    getFallbackReply(lastMessage);
+
+  return NextResponse.json({ reply });
 }
 
 // ─── Fallback replies (when no OpenAI key is set) ─────────────
